@@ -1,14 +1,11 @@
 /*****************************************************************************\
- *  acct_gather_profile_influxdb.c - slurm accounting plugin for influxdb
+ *  acct_gather_profile_mila.c - slurm accounting plugin for mila
  *				     profiling.
  *****************************************************************************
- *  Author: Carlos Fenoy Garcia
- *  Copyright (C) 2016 F. Hoffmann - La Roche
+ *  Author: Pierre Delaunay
+ *  Copyright (C) 2019
  *
  *  Based on the HDF5 profiling plugin and Elasticsearch job completion plugin.
- *
- *  Portions Copyright (C) 2013 Bull S. A. S.
- *		Bull, Rue Jean Jaures, B.P.68, 78340, Les Clayes-sous-Bois.
  *
  *  Portions Copyright (C) 2013 SchedMD LLC.
  *
@@ -54,7 +51,10 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <math.h>
+
+#include <nvml.h>
 #include <curl/curl.h>
 
 #include "src/common/slurm_xlator.h"
@@ -92,8 +92,8 @@
  * plugin_version - an unsigned 32-bit integer containing the Slurm version
  * (major.minor.micro combined into a single number).
  */
-const char plugin_name[] = "AcctGatherProfile influxdb plugin";
-const char plugin_type[] = "acct_gather_profile/influxdb";
+const char plugin_name[] = "AcctGatherProfile mila plugin";
+const char plugin_type[] = "acct_gather_profile/mila";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 typedef struct {
@@ -103,7 +103,7 @@ typedef struct {
 	char *password;
 	char *rt_policy;
 	char *username;
-} slurm_influxdb_conf_t;
+} slurm_mila_conf_t;
 
 typedef struct {
 	char ** names;
@@ -111,6 +111,11 @@ typedef struct {
 	size_t size;
 	char * name;
 } table_t;
+
+typedef struct {
+    const char* name;
+    float value;
+} metric_t;
 
 /* Type for handling HTTP responses */
 struct http_response {
@@ -123,7 +128,7 @@ union data_t{
 	double	 d;
 };
 
-static slurm_influxdb_conf_t influxdb_conf;
+static slurm_mila_conf_t mila_conf;
 static uint32_t g_profile_running = ACCT_GATHER_PROFILE_NOT_SET;
 static stepd_step_rec_t *g_job = NULL;
 
@@ -133,6 +138,9 @@ static int datastrlen = 0;
 static table_t *tables = NULL;
 static size_t tables_max_len = 0;
 static size_t tables_cur_len = 0;
+
+static  nvmlDevice_t* job_devices = NULL;
+static size_t device_count = 0;
 
 static void _free_tables(void)
 {
@@ -163,7 +171,7 @@ static uint32_t _determine_profile(void)
 	else if (g_job->profile >= ACCT_GATHER_PROFILE_NONE)
 		profile = g_job->profile;
 	else
-		profile = influxdb_conf.def;
+                profile = mila_conf.def;
 
 	return profile;
 }
@@ -203,7 +211,7 @@ static size_t _write_callback(void *contents, size_t size, size_t nmemb,
 	return realsize;
 }
 
-/* Try to send data to influxdb */
+/* Try to send data to mila */
 static int _send_data(const char *data)
 {
 	CURL *curl_handle = NULL;
@@ -219,7 +227,7 @@ static int _send_data(const char *data)
 
 	/*
 	 * Every compute node which is sampling data will try to establish a
-	 * different connection to the influxdb server. In order to reduce the
+         * different connection to the mila server. In order to reduce the
 	 * number of connections, every time a new sampled data comes in, it
 	 * is saved in the 'datastr' buffer. Once this buffer is full, then we
 	 * try to open the connection and send this buffer, instead of opening
@@ -248,22 +256,22 @@ static int _send_data(const char *data)
 		goto cleanup_easy_init;
 	}
 
-	xstrfmtcat(url, "%s/write?db=%s&rp=%s&precision=s", influxdb_conf.host,
-		   influxdb_conf.database, influxdb_conf.rt_policy);
+        xstrfmtcat(url, "%s/write?db=%s&rp=%s&precision=s", mila_conf.host,
+                   mila_conf.database, mila_conf.rt_policy);
 
 	chunk.message = xmalloc(1);
 	chunk.size = 0;
 
 	curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-	if (influxdb_conf.password)
+        if (mila_conf.password)
 		curl_easy_setopt(curl_handle, CURLOPT_PASSWORD,
-				 influxdb_conf.password);
+                                 mila_conf.password);
 	curl_easy_setopt(curl_handle, CURLOPT_POST, 1);
 	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, datastr);
 	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, strlen(datastr));
-	if (influxdb_conf.username)
+        if (mila_conf.username)
 		curl_easy_setopt(curl_handle, CURLOPT_USERNAME,
-				 influxdb_conf.username);
+                                 mila_conf.username);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _write_callback);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *) &chunk);
 
@@ -284,10 +292,10 @@ static int _send_data(const char *data)
 	}
 
 	/* In general, status codes of the form 2xx indicate success,
-	 * 4xx indicate that InfluxDB could not understand the request, and
+         * 4xx indicate that MilaDB could not understand the request, and
 	 * 5xx indicate that the system is overloaded or significantly impaired.
 	 * Errors are returned in JSON.
-	 * https://docs.influxdata.com/influxdb/v0.13/concepts/api/
+         * https://docs.influxdata.com/mila/v0.13/concepts/api/
 	 */
 	if (response_code >= 200 && response_code <= 205) {
 		debug2("%s %s: data write success", plugin_type, __func__);
@@ -330,6 +338,17 @@ cleanup_global_init:
 	return rc;
 }
 
+// check NVML return code
+int check(nvmlReturn_t error, const char *file, const char *fun, int line, const char *call_str)
+{
+    if (error != NVML_SUCCESS) {
+        debug("[!] %s/%s:%d %s %s\n", file, fun, line, nvmlErrorString(error), call_str);
+        return 0;
+    };
+    return 1;
+}
+#define CHK(X) check(X, __FILE__, __func__, __LINE__, #X)
+
 /*
  * init() is called when the plugin is loaded, before any other functions
  * are called. Put global initialization here.
@@ -341,6 +360,7 @@ extern int init(void)
 	if (!_run_in_daemon())
 		return SLURM_SUCCESS;
 
+        CHK(nvmlInitWithFlags(NVML_INIT_FLAG_NO_GPUS));
 	datastr = xmalloc(BUF_SIZE);
 	return SLURM_SUCCESS;
 }
@@ -348,14 +368,15 @@ extern int init(void)
 extern int fini(void)
 {
 	debug3("%s %s called", plugin_type, __func__);
+        CHK(nvmlShutdown());
 
 	_free_tables();
 	xfree(datastr);
-	xfree(influxdb_conf.host);
-	xfree(influxdb_conf.database);
-	xfree(influxdb_conf.password);
-	xfree(influxdb_conf.rt_policy);
-	xfree(influxdb_conf.username);
+        xfree(mila_conf.host);
+        xfree(mila_conf.database);
+        xfree(mila_conf.password);
+        xfree(mila_conf.rt_policy);
+        xfree(mila_conf.username);
 	return SLURM_SUCCESS;
 }
 
@@ -365,12 +386,12 @@ extern void acct_gather_profile_p_conf_options(s_p_options_t **full_options,
 	debug3("%s %s called", plugin_type, __func__);
 
 	s_p_options_t options[] = {
-		{"ProfileInfluxDBHost", S_P_STRING},
-		{"ProfileInfluxDBDatabase", S_P_STRING},
-		{"ProfileInfluxDBDefault", S_P_STRING},
-		{"ProfileInfluxDBPass", S_P_STRING},
-		{"ProfileInfluxDBRTPolicy", S_P_STRING},
-		{"ProfileInfluxDBUser", S_P_STRING},
+                {"ProfileMilaDBHost", S_P_STRING},
+                {"ProfileMilaDBDatabase", S_P_STRING},
+                {"ProfileMilaDBDefault", S_P_STRING},
+                {"ProfileMilaDBPass", S_P_STRING},
+                {"ProfileMilaDBRTPolicy", S_P_STRING},
+                {"ProfileMilaDBUser", S_P_STRING},
 		{NULL} };
 
 	transfer_s_p_options(full_options, options, full_options_cnt);
@@ -383,41 +404,41 @@ extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
 
 	debug3("%s %s called", plugin_type, __func__);
 
-	influxdb_conf.def = ACCT_GATHER_PROFILE_ALL;
+        mila_conf.def = ACCT_GATHER_PROFILE_ALL;
 	if (tbl) {
-		s_p_get_string(&influxdb_conf.host, "ProfileInfluxDBHost", tbl);
-		if (s_p_get_string(&tmp, "ProfileInfluxDBDefault", tbl)) {
-			influxdb_conf.def =
+                s_p_get_string(&mila_conf.host, "ProfileMilaDBHost", tbl);
+                if (s_p_get_string(&tmp, "ProfileMilaDBDefault", tbl)) {
+                        mila_conf.def =
 				acct_gather_profile_from_string(tmp);
-			if (influxdb_conf.def == ACCT_GATHER_PROFILE_NOT_SET)
-				fatal("ProfileInfluxDBDefault can not be set to %s, please specify a valid option",
+                        if (mila_conf.def == ACCT_GATHER_PROFILE_NOT_SET)
+                                fatal("ProfileMilaDBDefault can not be set to %s, please specify a valid option",
 				      tmp);
 			xfree(tmp);
 		}
-		s_p_get_string(&influxdb_conf.database,
-			       "ProfileInfluxDBDatabase", tbl);
-		s_p_get_string(&influxdb_conf.password,
-			       "ProfileInfluxDBPass", tbl);
-		s_p_get_string(&influxdb_conf.rt_policy,
-			       "ProfileInfluxDBRTPolicy", tbl);
-		s_p_get_string(&influxdb_conf.username,
-			       "ProfileInfluxDBUser", tbl);
+                s_p_get_string(&mila_conf.database,
+                               "ProfileMilaDBDatabase", tbl);
+                s_p_get_string(&mila_conf.password,
+                               "ProfileMilaDBPass", tbl);
+                s_p_get_string(&mila_conf.rt_policy,
+                               "ProfileMilaDBRTPolicy", tbl);
+                s_p_get_string(&mila_conf.username,
+                               "ProfileMilaDBUser", tbl);
 	}
 
-	if (!influxdb_conf.host)
-		fatal("No ProfileInfluxDBHost in your acct_gather.conf file. This is required to use the %s plugin",
+        if (!mila_conf.host)
+                fatal("No ProfileMilaDBHost in your acct_gather.conf file. This is required to use the %s plugin",
 		      plugin_type);
 
-	if (!influxdb_conf.database)
-		fatal("No ProfileInfluxDBDatabase in your acct_gather.conf file. This is required to use the %s plugin",
+        if (!mila_conf.database)
+                fatal("No ProfileMilaDBDatabase in your acct_gather.conf file. This is required to use the %s plugin",
 		      plugin_type);
 
-	if (influxdb_conf.password && !influxdb_conf.username)
-		fatal("No ProfileInfluxDBUser in your acct_gather.conf file. This is required if ProfileInfluxDBPass is specified to use the %s plugin",
+        if (mila_conf.password && !mila_conf.username)
+                fatal("No ProfileMilaDBUser in your acct_gather.conf file. This is required if ProfileMilaDBPass is specified to use the %s plugin",
 		      plugin_type);
 
-	if (!influxdb_conf.rt_policy)
-		fatal("No ProfileInfluxDBRTPolicy in your acct_gather.conf file. This is required to use the %s plugin",
+        if (!mila_conf.rt_policy)
+                fatal("No ProfileMilaDBRTPolicy in your acct_gather.conf file. This is required to use the %s plugin",
 		      plugin_type);
 
 	debug("%s loaded", plugin_name);
@@ -433,10 +454,10 @@ extern void acct_gather_profile_p_get(enum acct_gather_profile_info info_type,
 
 	switch (info_type) {
 	case ACCT_GATHER_PROFILE_DIR:
-		*tmp_char = xstrdup(influxdb_conf.host);
+                *tmp_char = xstrdup(mila_conf.host);
 		break;
 	case ACCT_GATHER_PROFILE_DEFAULT:
-		*uint32 = influxdb_conf.def;
+                *uint32 = mila_conf.def;
 		break;
 	case ACCT_GATHER_PROFILE_RUNNING:
 		*uint32 = g_profile_running;
@@ -489,9 +510,14 @@ extern int acct_gather_profile_p_task_start(uint32_t taskid)
 
 	xassert(_run_in_daemon());
 	xassert(g_job);
-
 	xassert(g_profile_running != ACCT_GATHER_PROFILE_NOT_SET);
 
+        // Get the USED GPU!
+        job_devices = NULL;
+        device_count = 0;
+
+
+        // ---
 	if (g_profile_running <= ACCT_GATHER_PROFILE_NONE)
 		return rc;
 
@@ -572,21 +598,26 @@ extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
 
 	debug3("%s %s called", plugin_type, __func__);
 
+        // get username
+        struct passwd *pws;
+        pws = getpwuid(g_job->uid);
+        const char* username = pws->pw_name;
+
 	for(; i < table->size; i++) {
 		switch (table->types[i]) {
 		case PROFILE_FIELD_UINT64:
-			xstrfmtcat(str, "%s,job=%d,step=%d,task=%s,"
+                        xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
 				   "host=%s value=%"PRIu64" "
-				   "%"PRIu64"\n", table->names[i],
+                                   "%"PRIu64"\n", table->names[i], username,
 				   g_job->jobid, g_job->stepid,
 				   table->name, g_job->node_name,
 				   ((union data_t*)data)[i].u,
 				   sample_time);
 			break;
 		case PROFILE_FIELD_DOUBLE:
-			xstrfmtcat(str, "%s,job=%d,step=%d,task=%s,"
+                        xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
 				   "host=%s value=%.2f %"PRIu64""
-				   "\n", table->names[i],
+                                   "\n", table->names[i], username,
 				   g_job->jobid, g_job->stepid,
 				   table->name, g_job->node_name,
 				   ((union data_t*)data)[i].d,
@@ -596,8 +627,80 @@ extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
 			break;
 		}
 	}
+        debug("gather GPU info %d", dataset_id);
+        pid_t pid = g_job->jobacct->pid;
 
-	_send_data(str);
+        nvmlMemory_t mem_info;
+        nvmlUtilization_t util_info;
+
+        unsigned int encode_util = 0; float encode_avg = 0;
+        unsigned int decode_util = 0; float decode_avg = 0;
+        unsigned int       power = 0; float  power_avg = 0;
+
+        float  used_memory = 0;
+        float total_memory = 0;
+
+        float    gpu_util = 0;
+        float memory_util = 0;
+
+        unsigned int sample_period = 0;
+
+        for(int i = 0; i < device_count; ++i){
+             nvmlDevice_t* device = job_devices[i];
+
+             // Benzina uses the encode/decode
+             CHK(nvmlDeviceGetEncoderUtilization(device, &encode_util, &sample_period));
+             encode_avg += (float) encode_util;
+
+             CHK(nvmlDeviceGetDecoderUtilization(device, &decode_util, &sample_period));
+             decode_avg += (float) decode_util;
+
+             CHK(nvmlDeviceGetMemoryInfo(device, &mem_info));
+             used_memory += (float) mem_info.used;
+             total_memory = (float) mem_info.total;
+
+             CHK(nvmlDeviceGetPowerUsage(device, &power));
+             power_avg += (float) power;
+
+             CHK(nvmlDeviceGetUtilizationRates(device, &util_info));
+             gpu_util += (float) util_info.gpu;
+             memory_util  += (float) util_info.memory;
+        }
+
+        if (device_count > 0){
+            encode_avg  /= (float) device_count;
+            decode_avg  /= (float) device_count;
+            used_memory /= (float) device_count;
+            power_avg   /= (float) device_count;
+            gpu_util    /= (float) device_count;
+            memory_util /= (float) device_count;
+
+            metric_t metrics[] = {
+                {"encode" , encode_avg},
+                {"decode" , decode_avg},
+                {"used"   , used_memory},
+                {"total"  , total_memory},
+                {"power"  , power_avg},
+                {"compute", gpu_util},
+                {"mem"    , memory_util}
+            };
+
+            for(int i = 0; i < sizeof(metrics); i++){
+                metric_t* m = metrics[i];
+
+                xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
+                           "host=%s value=%.2f %"PRIu64""
+                           "\n", m->name, username,
+                           g_job->jobid, g_job->stepid,
+                           table->name, g_job->node_name,
+                           m->value,
+                           sample_time);
+            }
+        }
+
+        // GPU monitoring done
+        // ---------
+        _send_data(str);
 	xfree(str);
 
 	return SLURM_SUCCESS;
@@ -612,34 +715,34 @@ extern void acct_gather_profile_p_conf_values(List *data)
 	xassert(*data);
 
 	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileInfluxDBHost");
-	key_pair->value = xstrdup(influxdb_conf.host);
+        key_pair->name = xstrdup("ProfileMilaDBHost");
+        key_pair->value = xstrdup(mila_conf.host);
 	list_append(*data, key_pair);
 
 	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileInfluxDBDatabase");
-	key_pair->value = xstrdup(influxdb_conf.database);
+        key_pair->name = xstrdup("ProfileMilaDBDatabase");
+        key_pair->value = xstrdup(mila_conf.database);
 	list_append(*data, key_pair);
 
 	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileInfluxDBDefault");
+        key_pair->name = xstrdup("ProfileMilaDBDefault");
 	key_pair->value =
-		xstrdup(acct_gather_profile_to_string(influxdb_conf.def));
+                xstrdup(acct_gather_profile_to_string(mila_conf.def));
 	list_append(*data, key_pair);
 
 	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileInfluxDBPass");
-	key_pair->value = xstrdup(influxdb_conf.password);
+        key_pair->name = xstrdup("ProfileMilaDBPass");
+        key_pair->value = xstrdup(mila_conf.password);
 	list_append(*data, key_pair);
 
 	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileInfluxDBRTPolicy");
-	key_pair->value = xstrdup(influxdb_conf.rt_policy);
+        key_pair->name = xstrdup("ProfileMilaDBRTPolicy");
+        key_pair->value = xstrdup(mila_conf.rt_policy);
 	list_append(*data, key_pair);
 
 	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileInfluxDBUser");
-	key_pair->value = xstrdup(influxdb_conf.username);
+        key_pair->name = xstrdup("ProfileMilaDBUser");
+        key_pair->value = xstrdup(mila_conf.username);
 	list_append(*data, key_pair);
 
 	return;
