@@ -91,7 +91,8 @@ build_triplet = @build@
 host_triplet = @host@
 target_triplet = @target@
 @BUILD_HDF5_TRUE@am__append_1 = hdf5
-@WITH_CURL_TRUE@am__append_2 = influxdb mila
+@WITH_CURL_TRUE@am__append_2 = influxdb
+@BUILD_NVML_TRUE@@WITH_CURL_TRUE@am__append_3 = mila
 subdir = src/plugins/acct_gather_profile
 ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
 am__aclocal_m4_deps = $(top_srcdir)/auxdir/ax_check_compile_flag.m4 \
@@ -472,7 +473,7 @@ target_vendor = @target_vendor@
 top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-SUBDIRS = none $(am__append_1) $(am__append_2)
+SUBDIRS = none $(am__append_1) $(am__append_2) $(am__append_3)
 all: all-recursive
 
 .SUFFIXES:
