@@ -627,8 +627,8 @@ extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
 			break;
 		}
 	}
-        debug("gather GPU info %d", dataset_id);
-        pid_t pid = g_job->jobacct->pid;
+        debug("gather GPU info %d", table_id);
+        // pid_t pid = g_job->jobacct->pid;
 
         nvmlMemory_t mem_info;
         nvmlUtilization_t util_info;
@@ -686,14 +686,14 @@ extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
             };
 
             for(int i = 0; i < sizeof(metrics); i++){
-                metric_t* m = metrics[i];
+                metric_t m = metrics[i];
 
                 xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
                            "host=%s value=%.2f %"PRIu64""
-                           "\n", m->name, username,
+                           "\n", m.name, username,
                            g_job->jobid, g_job->stepid,
                            table->name, g_job->node_name,
-                           m->value,
+                           m.value,
                            sample_time);
             }
         }
