@@ -6,4 +6,5 @@ SUBDIRS += hdf5
 endif
 if WITH_CURL
 SUBDIRS += influxdb
+SUBDIRS += mila
 endif
